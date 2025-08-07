@@ -4,8 +4,7 @@ name: Kanban Label Management
 permissions:
   issues: write
   contents: read
-  projects: read
-
+  
 on:
   issues:
     types: [opened, closed, reopened]
