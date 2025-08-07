@@ -185,6 +185,75 @@ jobs:
               -d "{\"labels\":[\"$NEW_LABEL\"]}"
             
             echo "✅ Updated issue #$ISSUE_NUMBER with label: $NEW_LABEL"
+            
+            # Handle issue state based on label
+            if [ "$NEW_LABEL" = "done" ]; then
+              echo "Closing issue (moved to Done column)"
+              curl -s -X PATCH \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" \
+                -d '{"state":"closed"}'
+            else
+              echo "Ensuring issue is open"
+              curl -s -X PATCH \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" \
+                -d '{"state":"open"}'
+            fi
           else
             echo "No project column movements found for issue #$ISSUE_NUMBER"
+          fi
+
+  # Handle closed/reopened issues
+  handle-issue-state-changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && (github.event.action == 'closed' || github.event.action == 'reopened')
+    
+    steps:
+      - name: Update Labels for State Changes
+        run: |
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          ACTION="${{ github.event.action }}"
+          
+          echo "Issue #$ISSUE_NUMBER was $ACTION"
+          
+          if [ "$ACTION" = "closed" ]; then
+            echo "Adding 'done' label to closed issue"
+            
+            # Remove other status labels
+            for label in backlog ready in-progress in-review; do
+              curl -s -X DELETE \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/$label" 2>/dev/null || true
+            done
+            
+            # Add done label
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
+              -d '{"labels":["done"]}'
+              
+          elif [ "$ACTION" = "reopened" ]; then
+            echo "Updating reopened issue to 'backlog'"
+            
+            # Remove done label
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/done" 2>/dev/null || true
+            
+            # Add backlog label
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
+              -d '{"labels":["backlog"]}'
           fi
