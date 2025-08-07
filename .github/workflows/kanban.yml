@@ -355,10 +355,10 @@ jobs:
                   "Ready"|"Ready to Start")
                     EXPECTED_LABEL="ready"
                     ;;
-                  "In Progress"|"In-Progress"|"Working"|"Active")
+                  "In Progress"|"In progress"|"In-Progress"|"Working"|"Active")
                     EXPECTED_LABEL="in-progress"
                     ;;
-                  "In Review"|"Review"|"Testing"|"QA")
+                  "In Review"|"In review"|"In-review"|"Review"|"Testing"|"QA")
                     EXPECTED_LABEL="in-review"
                     ;;
                   "Done"|"Complete"|"Completed"|"Closed")
