@@ -1,341 +1,29 @@
-name: GraphQL Projects API Kanban Management
+name: Universal Project Debug
 
 permissions:
   issues: write
   contents: read
 
 on:
-  issues:
-    types: [opened, closed, reopened]
-  schedule:
-    # Check project status every 5 minutes
-    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
-      action:
-        description: 'Action to perform'
-        required: true
-        type: choice
-        default: 'check_project_items'
-        options:
-          - 'check_project_items'
-          - 'debug_single_issue'
-          - 'update_existing_issues'
       issue_number:
-        description: 'Issue number (for debugging)'
-        required: false
+        description: 'Issue number to debug'
+        required: true
 
 jobs:
-  # Handle new issues
-  assign-new-issues:
+  debug-all-project-types:
     runs-on: ubuntu-latest
-    if: github.event_name == 'issues' && github.event.action == 'opened'
     
     steps:
-      - name: Add Backlog Label to New Issues
-        run: |
-          ISSUE_NUMBER="${{ github.event.issue.number }}"
-          echo "🆕 Adding backlog label to new issue #$ISSUE_NUMBER"
-          
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
-            -d '{"labels":["backlog"]}'
-
-  # Handle closed/reopened issues
-  handle-state-changes:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'issues' && (github.event.action == 'closed' || github.event.action == 'reopened')
-    
-    steps:
-      - name: Update Status for State Changes
-        run: |
-          ISSUE_NUMBER="${{ github.event.issue.number }}"
-          ACTION="${{ github.event.action }}"
-          
-          if [ "$ACTION" = "closed" ]; then
-            echo "🔒 Setting closed issue to 'done'"
-            for label in backlog ready in-progress in-review; do
-              curl -s -X DELETE \
-                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/$label" 2>/dev/null || true
-            done
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
-              -d '{"labels":["done"]}'
-              
-          elif [ "$ACTION" = "reopened" ]; then
-            echo "🔓 Setting reopened issue back to 'backlog'"
-            curl -s -X DELETE \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/done" 2>/dev/null || true
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
-              -d '{"labels":["backlog"]}'
-          fi
-
-  # Check project items using GraphQL API
-  check-project-items:
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'schedule' || 
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'check_project_items')
-    
-    steps:
-      - name: Find Repository Projects
-        id: find_projects
-        run: |
-          echo "🔍 Finding repository projects using GraphQL..."
-          
-          # GraphQL query to find projects for this repository
-          GRAPHQL_QUERY='{
-            "query": "query($owner: String!, $repo: String!) {
-              repository(owner: $owner, name: $repo) {
-                projectsV2(first: 10) {
-                  nodes {
-                    id
-                    title
-                    number
-                  }
-                }
-              }
-            }",
-            "variables": {
-              "owner": "'$(echo ${{ github.repository }} | cut -d'/' -f1)'",
-              "repo": "'$(echo ${{ github.repository }} | cut -d'/' -f2)'"
-            }
-          }'
-          
-          echo "GraphQL Query: $GRAPHQL_QUERY"
-          
-          PROJECTS_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/graphql" \
-            -d "$GRAPHQL_QUERY")
-          
-          echo "Projects response:"
-          echo "$PROJECTS_RESPONSE" | jq '.'
-          
-          # Extract first project ID
-          PROJECT_ID=$(echo "$PROJECTS_RESPONSE" | jq -r '.data.repository.projectsV2.nodes[0].id // empty')
-          PROJECT_TITLE=$(echo "$PROJECTS_RESPONSE" | jq -r '.data.repository.projectsV2.nodes[0].title // empty')
-          
-          if [ -n "$PROJECT_ID" ]; then
-            echo "Found project: $PROJECT_TITLE (ID: $PROJECT_ID)"
-            echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
-            echo "project_title=$PROJECT_TITLE" >> $GITHUB_OUTPUT
-          else
-            echo "No projects found for this repository"
-            echo "project_id=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Get Project Items and Status
-        if: steps.find_projects.outputs.project_id != ''
-        run: |
-          PROJECT_ID="${{ steps.find_projects.outputs.project_id }}"
-          echo "📋 Getting items from project: ${{ steps.find_projects.outputs.project_title }}"
-          
-          # GraphQL query to get project items
-          GRAPHQL_QUERY='{
-            "query": "query($projectId: ID!) {
-              node(id: $projectId) {
-                ... on ProjectV2 {
-                  items(first: 50) {
-                    nodes {
-                      id
-                      content {
-                        ... on Issue {
-                          number
-                          title
-                          state
-                          repository {
-                            name
-                          }
-                        }
-                      }
-                      fieldValues(first: 10) {
-                        nodes {
-                          ... on ProjectV2ItemFieldSingleSelectValue {
-                            name
-                            field {
-                              ... on ProjectV2SingleSelectField {
-                                name
-                              }
-                            }
-                          }
-                          ... on ProjectV2ItemFieldTextValue {
-                            text
-                            field {
-                              ... on ProjectV2Field {
-                                name
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }",
-            "variables": {
-              "projectId": "'$PROJECT_ID'"
-            }
-          }'
-          
-          echo "Getting project items..."
-          ITEMS_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/graphql" \
-            -d "$GRAPHQL_QUERY")
-          
-          echo "Items response:"
-          echo "$ITEMS_RESPONSE" | jq '.'
-          
-          # Process each item
-          echo "$ITEMS_RESPONSE" | jq -c '.data.node.items.nodes[]' | while IFS= read -r item; do
-            # Extract issue information
-            ISSUE_NUMBER=$(echo "$item" | jq -r '.content.number // empty')
-            ISSUE_TITLE=$(echo "$item" | jq -r '.content.title // empty')
-            ISSUE_STATE=$(echo "$item" | jq -r '.content.state // empty')
-            REPO_NAME=$(echo "$item" | jq -r '.content.repository.name // empty')
-            
-            # Skip if not our repository
-            if [ "$REPO_NAME" != "$(echo ${{ github.repository }} | cut -d'/' -f2)" ]; then
-              continue
-            fi
-            
-            # Skip if no issue number
-            if [ -z "$ISSUE_NUMBER" ] || [ "$ISSUE_NUMBER" = "null" ]; then
-              continue
-            fi
-            
-            echo ""
-            echo "🔍 Processing issue #$ISSUE_NUMBER: $ISSUE_TITLE"
-            
-            # Find Status field value
-            STATUS_VALUE=$(echo "$item" | jq -r '
-              .fieldValues.nodes[] | 
-              select(.field.name == "Status") | 
-              .name // empty')
-            
-            if [ -n "$STATUS_VALUE" ] && [ "$STATUS_VALUE" != "null" ]; then
-              echo "📊 Project status: $STATUS_VALUE"
-              
-              # Map project status to label
-              case "$STATUS_VALUE" in
-                "Backlog"|"Todo"|"To Do")
-                  EXPECTED_LABEL="backlog"
-                  ;;
-                "Ready"|"Ready to Start")
-                  EXPECTED_LABEL="ready"
-                  ;;
-                "In Progress"|"In-Progress"|"Working")
-                  EXPECTED_LABEL="in-progress"
-                  ;;
-                "In Review"|"Review"|"Testing")
-                  EXPECTED_LABEL="in-review"
-                  ;;
-                "Done"|"Complete"|"Completed")
-                  EXPECTED_LABEL="done"
-                  ;;
-                *)
-                  echo "❓ Unknown status: $STATUS_VALUE - skipping"
-                  continue
-                  ;;
-              esac
-              
-              # Get current issue labels
-              CURRENT_ISSUE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER")
-              
-              CURRENT_LABELS=$(echo "$CURRENT_ISSUE" | jq -r '.labels[].name')
-              
-              echo "🏷️  Current labels: $(echo "$CURRENT_LABELS" | tr '\n' ', ' | sed 's/,$//')"
-              echo "🎯 Expected label: $EXPECTED_LABEL"
-              
-              # Check if update needed
-              if echo "$CURRENT_LABELS" | grep -q "^$EXPECTED_LABEL$"; then
-                echo "✅ Issue #$ISSUE_NUMBER already has correct label"
-              else
-                echo "🔄 Updating issue #$ISSUE_NUMBER to match project status"
-                
-                # Remove old status labels
-                for label in backlog ready in-progress in-review done; do
-                  if echo "$CURRENT_LABELS" | grep -q "^$label$"; then
-                    echo "  🗑️  Removing: $label"
-                    curl -s -X DELETE \
-                      -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                      -H "Accept: application/vnd.github.v3+json" \
-                      "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/$label" || true
-                  fi
-                done
-                
-                # Add new label
-                echo "  ➕ Adding: $EXPECTED_LABEL"
-                curl -s -X POST \
-                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                  -H "Accept: application/vnd.github.v3+json" \
-                  -H "Content-Type: application/json" \
-                  "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
-                  -d "{\"labels\":[\"$EXPECTED_LABEL\"]}"
-                
-                # Handle issue state
-                if [ "$EXPECTED_LABEL" = "done" ] && [ "$ISSUE_STATE" = "OPEN" ]; then
-                  echo "  🔒 Closing issue (project status is Done)"
-                  curl -s -X PATCH \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    -H "Content-Type: application/json" \
-                    "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" \
-                    -d '{"state":"closed"}'
-                elif [ "$EXPECTED_LABEL" != "done" ] && [ "$ISSUE_STATE" = "CLOSED" ]; then
-                  echo "  🔓 Reopening issue (project status is not Done)"
-                  curl -s -X PATCH \
-                    -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    -H "Content-Type: application/json" \
-                    "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" \
-                    -d '{"state":"open"}'
-                fi
-                
-                echo "  ✅ Issue #$ISSUE_NUMBER updated!"
-              fi
-            else
-              echo "📝 No status field found for issue #$ISSUE_NUMBER"
-            fi
-            
-            sleep 0.5  # Rate limiting
-          done
-
-  # Debug single issue
-  debug-single-issue:
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' && 
-      github.event.inputs.action == 'debug_single_issue' && 
-      github.event.inputs.issue_number != ''
-    
-    steps:
-      - name: Debug Single Issue in Project
+      - name: Debug GraphQL Response
         run: |
           ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
-          echo "🔍 Debugging issue #$ISSUE_NUMBER in projects..."
+          echo "🔍 Full debugging for issue #$ISSUE_NUMBER"
+          echo "Repository: ${{ github.repository }}"
+          echo "=================================================="
           
-          # First find projects
+          # First, let's see the raw GraphQL response
           GRAPHQL_QUERY='{
             "query": "query($owner: String!, $repo: String!) {
               repository(owner: $owner, name: $repo) {
@@ -354,131 +42,187 @@ jobs:
             }
           }'
           
+          echo "🌐 Making GraphQL query for Projects V2..."
+          echo "Query: $GRAPHQL_QUERY"
+          
           PROJECTS_RESPONSE=$(curl -s -X POST \
             -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://api.github.com/graphql" \
             -d "$GRAPHQL_QUERY")
           
-          echo "📋 Available projects:"
-          echo "$PROJECTS_RESPONSE" | jq '.data.repository.projectsV2.nodes[] | "- " + .title + " (ID: " + .id + ")"'
+          echo ""
+          echo "📄 Raw GraphQL Response:"
+          echo "$PROJECTS_RESPONSE" | jq '.'
           
-          PROJECT_ID=$(echo "$PROJECTS_RESPONSE" | jq -r '.data.repository.projectsV2.nodes[0].id // empty')
-          
-          if [ -n "$PROJECT_ID" ]; then
+          # Check if there's an error
+          if echo "$PROJECTS_RESPONSE" | jq -e '.errors' > /dev/null; then
             echo ""
-            echo "🔍 Looking for issue #$ISSUE_NUMBER in project..."
-            
-            # Search for the specific issue in the project
-            ISSUE_QUERY='{
-              "query": "query($projectId: ID!) {
-                node(id: $projectId) {
-                  ... on ProjectV2 {
-                    items(first: 100) {
-                      nodes {
-                        id
-                        content {
-                          ... on Issue {
-                            number
-                            title
-                            state
-                          }
-                        }
-                        fieldValues(first: 20) {
-                          nodes {
-                            ... on ProjectV2ItemFieldSingleSelectValue {
-                              name
-                              field {
-                                ... on ProjectV2SingleSelectField {
-                                  name
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }",
-              "variables": {
-                "projectId": "'$PROJECT_ID'"
-              }
-            }'
-            
-            ITEMS_RESPONSE=$(curl -s -X POST \
-              -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/graphql" \
-              -d "$ISSUE_QUERY")
-            
-            echo "🔍 Searching for issue #$ISSUE_NUMBER..."
-            FOUND_ITEM=$(echo "$ITEMS_RESPONSE" | jq --arg issue_num "$ISSUE_NUMBER" '
-              .data.node.items.nodes[] | 
-              select(.content.number == ($issue_num | tonumber))')
-            
-            if [ -n "$FOUND_ITEM" ] && [ "$FOUND_ITEM" != "null" ]; then
-              echo "✅ Found issue #$ISSUE_NUMBER in project!"
-              echo ""
-              echo "📊 Project item details:"
-              echo "$FOUND_ITEM" | jq '.'
-              
-              echo ""
-              echo "🏷️  Field values:"
-              echo "$FOUND_ITEM" | jq -r '.fieldValues.nodes[] | select(.field != null) | .field.name + ": " + (.name // "null")'
-              
-            else
-              echo "❌ Issue #$ISSUE_NUMBER not found in project"
-              echo ""
-              echo "📋 Issues found in project:"
-              echo "$ITEMS_RESPONSE" | jq -r '.data.node.items.nodes[] | select(.content.number != null) | "- Issue #" + (.content.number | tostring) + ": " + .content.title'
-            fi
-          else
-            echo "❌ No projects found for this repository"
+            echo "❌ GraphQL Errors found:"
+            echo "$PROJECTS_RESPONSE" | jq '.errors'
           fi
 
-  # Update existing issues
-  update-existing:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'update_existing_issues'
-    
-    steps:
-      - name: Add Default Labels to Issues Without Status
+      - name: Check Classic Projects (REST API)
         run: |
-          echo "🔄 Adding default labels to issues without status labels..."
+          echo ""
+          echo "🔍 Checking for Classic Projects (REST API)..."
           
-          # Open issues get backlog
-          OPEN_ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          CLASSIC_PROJECTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues?state=open&per_page=100" | \
-            jq -r '.[] | select(.labels | map(.name) | index("backlog") == null and index("ready") == null and index("in-progress") == null and index("in-review") == null and index("done") == null) | .number')
+            "https://api.github.com/repos/${{ github.repository }}/projects" 2>/dev/null || echo "[]")
           
-          for issue in $OPEN_ISSUES; do
-            echo "Adding backlog to open issue #$issue"
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$issue/labels" \
-              -d '{"labels":["backlog"]}'
-            sleep 0.5
-          done
+          echo "📋 Classic Projects Response:"
+          echo "$CLASSIC_PROJECTS" | jq '.'
           
-          # Closed issues get done
-          CLOSED_ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues?state=closed&per_page=50" | \
-            jq -r '.[] | select(.labels | map(.name) | index("backlog") == null and index("ready") == null and index("in-progress") == null and index("in-review") == null and index("done") == null) | .number')
+          if [ "$(echo "$CLASSIC_PROJECTS" | jq length)" -gt 0 ]; then
+            echo ""
+            echo "✅ Found $(echo "$CLASSIC_PROJECTS" | jq length) Classic Project(s):"
+            echo "$CLASSIC_PROJECTS" | jq -r '.[] | "- " + .name + " (ID: " + (.id | tostring) + ")"'
+            
+            # For each classic project, get columns
+            echo "$CLASSIC_PROJECTS" | jq -r '.[0].id' | while read project_id; do
+              if [ -n "$project_id" ] && [ "$project_id" != "null" ]; then
+                echo ""
+                echo "🗂️ Columns in Classic Project $project_id:"
+                COLUMNS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/projects/$project_id/columns")
+                
+                echo "$COLUMNS" | jq -r '.[] | "  - " + .name + " (ID: " + (.id | tostring) + ")"'
+                
+                # For each column, check for cards
+                echo "$COLUMNS" | jq -r '.[0].id' | while read column_id; do
+                  if [ -n "$column_id" ] && [ "$column_id" != "null" ]; then
+                    echo ""
+                    echo "🃏 Cards in first column ($column_id):"
+                    CARDS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                      -H "Accept: application/vnd.github.v3+json" \
+                      "https://api.github.com/projects/columns/$column_id/cards")
+                    
+                    echo "$CARDS" | jq -r '.[] | 
+                      if .content_url then 
+                        "  - Card: " + (.content_url | split("/") | last) 
+                      else 
+                        "  - Note card: " + (.note // "no note")
+                      end'
+                  fi
+                done
+              fi
+            done
+          else
+            echo "❌ No Classic Projects found"
+          fi
+
+      - name: Check Organization Projects
+        run: |
+          echo ""
+          echo "🔍 Checking for Organization-level Projects..."
           
-          for issue in $CLOSED_ISSUES; do
-            echo "Adding done to closed issue #$issue"
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$issue/labels" \
-              -d '{"labels":["done"]}'
-            sleep 0.5
-          done
+          ORG_NAME=$(echo ${{ github.repository }} | cut -d'/' -f1)
           
-          echo "✅ All existing issues updated!"
+          # Try to get organization projects
+          ORG_PROJECTS_QUERY='{
+            "query": "query($org: String!) {
+              organization(login: $org) {
+                projectsV2(first: 10) {
+                  nodes {
+                    id
+                    title
+                    number
+                  }
+                }
+              }
+            }",
+            "variables": {
+              "org": "'$ORG_NAME'"
+            }
+          }'
+          
+          echo "🌐 Checking organization projects for: $ORG_NAME"
+          
+          ORG_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "$ORG_PROJECTS_QUERY")
+          
+          echo "📄 Organization Projects Response:"
+          echo "$ORG_RESPONSE" | jq '.'
+          
+          if echo "$ORG_RESPONSE" | jq -e '.data.organization.projectsV2.nodes | length > 0' > /dev/null 2>&1; then
+            echo ""
+            echo "✅ Found organization projects:"
+            echo "$ORG_RESPONSE" | jq -r '.data.organization.projectsV2.nodes[] | "- " + .title + " (ID: " + .id + ")"'
+          fi
+
+      - name: Check User Projects
+        run: |
+          echo ""
+          echo "🔍 Checking for User-level Projects..."
+          
+          USER_NAME=$(echo ${{ github.repository }} | cut -d'/' -f1)
+          
+          USER_PROJECTS_QUERY='{
+            "query": "query($user: String!) {
+              user(login: $user) {
+                projectsV2(first: 10) {
+                  nodes {
+                    id
+                    title
+                    number
+                  }
+                }
+              }
+            }",
+            "variables": {
+              "user": "'$USER_NAME'"
+            }
+          }'
+          
+          echo "🌐 Checking user projects for: $USER_NAME"
+          
+          USER_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "$USER_PROJECTS_QUERY")
+          
+          echo "📄 User Projects Response:"
+          echo "$USER_RESPONSE" | jq '.'
+          
+          if echo "$USER_RESPONSE" | jq -e '.data.user.projectsV2.nodes | length > 0' > /dev/null 2>&1; then
+            echo ""
+            echo "✅ Found user projects:"
+            echo "$USER_RESPONSE" | jq -r '.data.user.projectsV2.nodes[] | "- " + .title + " (ID: " + .id + ")"'
+          fi
+
+      - name: Final Analysis and Recommendations
+        run: |
+          echo ""
+          echo "🎯 Analysis and Recommendations:"
+          echo "=================================================="
+          echo ""
+          echo "Based on the API responses above, here's what we found:"
+          echo ""
+          echo "1. **Repository Projects (Beta)**: Check the first GraphQL response"
+          echo "2. **Classic Projects**: Check the REST API response" 
+          echo "3. **Organization Projects (Beta)**: Check the org GraphQL response"
+          echo "4. **User Projects (Beta)**: Check the user GraphQL response"
+          echo ""
+          echo "💡 **Next Steps:**"
+          echo ""
+          echo "If you see Classic Projects listed above:"
+          echo "- We can use the REST API timeline approach (but it has limitations)"
+          echo "- Consider migrating to Projects (Beta) for better API support"
+          echo ""
+          echo "If you see Projects (Beta) listed above:"
+          echo "- We can use the GraphQL API approach (recommended)"
+          echo "- The project might be at user or organization level, not repository level"
+          echo ""
+          echo "If no projects found:"
+          echo "- Create a new GitHub Project (Beta) and link it to this repository"
+          echo "- Or use the comment-based hybrid approach we discussed"
+          echo ""
+          echo "🔗 **Your project board URL format:**"
+          echo "- Classic Projects: github.com/${{ github.repository }}/projects/X"
+          echo "- Projects (Beta): github.com/users/USERNAME/projects/X or github.com/orgs/ORGNAME/projects/X"
