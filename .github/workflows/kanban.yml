@@ -1,127 +1,60 @@
-name: Kanban Label Management
+name: Manual Kanban Test
 
 on:
-  project_card:
-    types: [moved, created]
-  issues:
-    types: [opened]
-  workflow_dispatch:  # Allows manual triggering
+  workflow_dispatch:
     inputs:
-      update_existing:
-        description: 'Update all existing issues with default labels'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
+      issue_number:
+        description: 'Issue number to check and update'
+        required: true
+        type: string
 
 jobs:
-  # Job to update existing issues (manual trigger only)
-  update-existing-issues:
+  test-single-issue:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.update_existing == 'true'
     
     steps:
-      - name: Update Existing Open Issues
+      - name: Get Issue Timeline
+        id: timeline
         run: |
-          echo "Fetching open issues without status labels..."
+          ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
+          echo "Checking timeline for issue #$ISSUE_NUMBER..."
           
-          # Get all open issues
-          ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          # Get timeline with detailed output
+          TIMELINE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues?state=open&per_page=100" | \
-            jq -r '.[] | select(.labels | map(.name) | index("backlog") == null and index("ready") == null and index("in-progress") == null and index("in-review") == null and index("done") == null) | .number')
+            "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/timeline")
           
-          # Add backlog label to issues without status labels
-          for issue in $ISSUES; do
-            echo "Adding backlog label to issue #$issue"
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$issue/labels" \
-              -d '{"labels":["backlog"]}'
-            sleep 1  # Rate limiting
-          done
+          echo "Full timeline:"
+          echo "$TIMELINE" | jq '.'
+          
+          # Find project movements
+          echo "Project movements:"
+          echo "$TIMELINE" | jq '[.[] | select(.event == "moved_columns_in_project" or .event == "added_to_project")]'
+          
+          # Get the latest column
+          LATEST_COLUMN=$(echo "$TIMELINE" | jq -r '
+            [.[] | select(.event == "moved_columns_in_project" or .event == "added_to_project")] | 
+            if length > 0 then 
+              sort_by(.created_at) | last | .project_card.column_name 
+            else 
+              "none" 
+            end')
+          
+          echo "Latest column: $LATEST_COLUMN"
+          echo "latest_column=$LATEST_COLUMN" >> $GITHUB_OUTPUT
 
-      - name: Update Existing Closed Issues
+      - name: Update Labels Based on Column
         run: |
-          echo "Fetching closed issues without status labels..."
+          ISSUE_NUMBER="${{ github.event.inputs.issue_number }}"
+          LATEST_COLUMN="${{ steps.timeline.outputs.latest_column }}"
           
-          # Get recent closed issues
-          CLOSED_ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues?state=closed&per_page=50" | \
-            jq -r '.[] | select(.labels | map(.name) | index("backlog") == null and index("ready") == null and index("in-progress") == null and index("in-review") == null and index("done") == null) | .number')
+          if [ "$LATEST_COLUMN" = "none" ] || [ "$LATEST_COLUMN" = "null" ]; then
+            echo "No project column found for issue #$ISSUE_NUMBER"
+            exit 0
+          fi
           
-          # Add done label to closed issues without status labels
-          for issue in $CLOSED_ISSUES; do
-            echo "Adding done label to closed issue #$issue"
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$issue/labels" \
-              -d '{"labels":["done"]}'
-            sleep 1  # Rate limiting
-          done
-
-  update-labels:
-    runs-on: ubuntu-latest
-    if: github.event.project_card.content_url
-    
-    steps:
-      - name: Get Issue Number
-        id: get_issue
-        run: |
-          # Extract issue number from content_url
-          ISSUE_URL="${{ github.event.project_card.content_url }}"
-          ISSUE_NUMBER=$(echo $ISSUE_URL | grep -o '[0-9]*$')
-          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
-          echo "Issue number: $ISSUE_NUMBER"
-
-      - name: Get Project Column Name
-        id: get_column
-        run: |
-          COLUMN_ID="${{ github.event.project_card.column_id }}"
-          COLUMN_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/projects/columns/$COLUMN_ID")
-          
-          COLUMN_NAME=$(echo "$COLUMN_INFO" | jq -r '.name')
-          echo "column_name=$COLUMN_NAME" >> $GITHUB_OUTPUT
-          echo "Column name: $COLUMN_NAME"
-
-      - name: Remove Old Status Labels
-        run: |
-          ISSUE_NUMBER="${{ steps.get_issue.outputs.issue_number }}"
-          
-          # Get current labels
-          CURRENT_LABELS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" | \
-            jq -r '.labels[].name')
-          
-          # Remove status labels
-          STATUS_LABELS=("backlog" "ready" "in-progress" "in-review" "done")
-          for label in "${STATUS_LABELS[@]}"; do
-            if echo "$CURRENT_LABELS" | grep -q "^$label$"; then
-              echo "Removing label: $label"
-              curl -s -X DELETE \
-                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/$label"
-            fi
-          done
-
-      - name: Add New Status Label
-        run: |
-          ISSUE_NUMBER="${{ steps.get_issue.outputs.issue_number }}"
-          COLUMN_NAME="${{ steps.get_column.outputs.column_name }}"
-          
-          # Map column names to labels
-          case "$COLUMN_NAME" in
+          # Map column to label
+          case "$LATEST_COLUMN" in
             "Backlog")
               NEW_LABEL="backlog"
               ;;
@@ -138,11 +71,24 @@ jobs:
               NEW_LABEL="done"
               ;;
             *)
-              echo "Unknown column: $COLUMN_NAME"
+              echo "Unknown column: $LATEST_COLUMN"
               exit 0
               ;;
           esac
           
+          echo "Updating issue #$ISSUE_NUMBER to label: $NEW_LABEL"
+          
+          # Remove old status labels
+          STATUS_LABELS=("backlog" "ready" "in-progress" "in-review" "done")
+          for label in "${STATUS_LABELS[@]}"; do
+            echo "Removing label: $label"
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels/$label" || true
+          done
+          
+          # Add new label
           echo "Adding label: $NEW_LABEL"
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
@@ -150,15 +96,10 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
             -d "{\"labels\":[\"$NEW_LABEL\"]}"
-
-      - name: Update Issue State
-        run: |
-          ISSUE_NUMBER="${{ steps.get_issue.outputs.issue_number }}"
-          COLUMN_NAME="${{ steps.get_column.outputs.column_name }}"
           
-          # Close issue if moved to Done
-          if [ "$COLUMN_NAME" = "Done" ]; then
-            echo "Closing issue as it's moved to Done"
+          # Handle issue state
+          if [ "$NEW_LABEL" = "done" ]; then
+            echo "Closing issue (moved to Done)"
             curl -s -X PATCH \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
@@ -166,7 +107,6 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" \
               -d '{"state":"closed"}'
           else
-            # Reopen issue if moved from Done to any other column
             echo "Ensuring issue is open"
             curl -s -X PATCH \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
@@ -175,21 +115,3 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER" \
               -d '{"state":"open"}'
           fi
-
-  # Job to handle new issues (assign to backlog by default)
-  assign-new-issues:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'issues' && github.event.action == 'opened'
-    
-    steps:
-      - name: Add Backlog Label to New Issues
-        run: |
-          ISSUE_NUMBER="${{ github.event.issue.number }}"
-          
-          echo "Adding backlog label to new issue #$ISSUE_NUMBER"
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
-            -d '{"labels":["backlog"]}'
