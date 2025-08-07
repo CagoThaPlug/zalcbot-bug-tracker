@@ -1,4 +1,4 @@
-name: User-Level Projects Kanban Management
+name: ProjectsV2 GraphQL Kanban Management
 
 permissions:
   issues: write
@@ -16,14 +16,15 @@ on:
         description: 'Action to perform'
         required: true
         type: choice
-        default: 'find_and_sync_projects'
+        default: 'sync_projects'
         options:
-          - 'find_and_sync_projects'
-          - 'debug_project_search'
+          - 'sync_projects'
+          - 'debug_project_structure'
           - 'update_existing_issues'
-      issue_number:
-        description: 'Issue number (for debugging)'
+      project_number:
+        description: 'Project number to sync (default: 1)'
         required: false
+        default: '1'
 
 jobs:
   # Handle new issues
@@ -84,121 +85,140 @@ jobs:
               -d '{"labels":["backlog"]}'
           fi
 
-  # Debug project search
-  debug-project-search:
+  # Debug project structure
+  debug-project-structure:
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'workflow_dispatch' && 
-      github.event.inputs.action == 'debug_project_search'
+      github.event.inputs.action == 'debug_project_structure'
     
     steps:
-      - name: Search All Project Locations
+      - name: Debug ProjectsV2 Structure
         run: |
-          echo "🔍 Comprehensive project search..."
-          OWNER=$(echo ${{ github.repository }} | cut -d'/' -f1)
-          REPO=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          PROJECT_NUM="${{ github.event.inputs.project_number }}"
+          echo "🔍 Debugging ProjectsV2 structure for project #$PROJECT_NUM"
+          echo "========================================="
           
-          echo "Repository: ${{ github.repository }}"
-          echo "Owner: $OWNER"
-          echo "Repo: $REPO"
-          echo ""
+          # Step 1: Get all accessible projects using viewer query
+          echo "📋 Step 1: Finding all accessible ProjectsV2..."
           
-          # 1. User projects
-          echo "👤 Searching user projects for: $OWNER"
-          USER_QUERY='{
-            "query": "query($login: String!) {
-              user(login: $login) {
+          PROJECTS_QUERY='{
+            "query": "query {
+              viewer {
                 projectsV2(first: 20) {
                   nodes {
                     id
                     title
                     number
-                    shortDescription
                     url
+                    shortDescription
+                    public
+                    closed
+                    createdAt
+                    updatedAt
                   }
                 }
               }
-            }",
-            "variables": {
-              "login": "'$OWNER'"
-            }
+            }"
           }'
           
-          USER_RESPONSE=$(curl -s -X POST \
+          PROJECTS_RESPONSE=$(curl -s -X POST \
             -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://api.github.com/graphql" \
-            -d "$USER_QUERY")
+            -d "$PROJECTS_QUERY")
           
-          echo "User projects found:"
-          if echo "$USER_RESPONSE" | jq -e '.data.user.projectsV2.nodes | length > 0' >/dev/null 2>&1; then
-            echo "$USER_RESPONSE" | jq -r '.data.user.projectsV2.nodes[] | "  ✅ " + .title + " (ID: " + .id + ") - " + .url'
+          echo "Projects found:"
+          echo "$PROJECTS_RESPONSE" | jq '.'
+          
+          # Find the target project
+          TARGET_PROJECT=$(echo "$PROJECTS_RESPONSE" | jq --arg num "$PROJECT_NUM" '
+            .data.viewer.projectsV2.nodes[] | select(.number == ($num | tonumber))')
+          
+          if [ -n "$TARGET_PROJECT" ] && [ "$TARGET_PROJECT" != "null" ]; then
+            PROJECT_ID=$(echo "$TARGET_PROJECT" | jq -r '.id')
+            PROJECT_TITLE=$(echo "$TARGET_PROJECT" | jq -r '.title')
             
-            # Store the first project ID for later use
-            FIRST_PROJECT_ID=$(echo "$USER_RESPONSE" | jq -r '.data.user.projectsV2.nodes[0].id')
-            echo "first_project_id=$FIRST_PROJECT_ID" >> $GITHUB_ENV
-          else
-            echo "  ❌ No user projects found"
-            echo "$USER_RESPONSE" | jq '.errors // empty'
-          fi
-          
-          echo ""
-          
-          # 2. Try organization projects (in case it's an org repo)
-          echo "🏢 Searching organization projects for: $OWNER"
-          ORG_QUERY='{
-            "query": "query($login: String!) {
-              organization(login: $login) {
-                projectsV2(first: 20) {
-                  nodes {
-                    id
-                    title
-                    number
-                    shortDescription
-                    url
-                  }
-                }
-              }
-            }",
-            "variables": {
-              "login": "'$OWNER'"
-            }
-          }'
-          
-          ORG_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/graphql" \
-            -d "$ORG_QUERY")
-          
-          echo "Organization projects found:"
-          if echo "$ORG_RESPONSE" | jq -e '.data.organization.projectsV2.nodes | length > 0' >/dev/null 2>&1; then
-            echo "$ORG_RESPONSE" | jq -r '.data.organization.projectsV2.nodes[] | "  ✅ " + .title + " (ID: " + .id + ") - " + .url'
-            
-            # Use org project if no user project found
-            if [ -z "${FIRST_PROJECT_ID:-}" ]; then
-              FIRST_PROJECT_ID=$(echo "$ORG_RESPONSE" | jq -r '.data.organization.projectsV2.nodes[0].id')
-              echo "first_project_id=$FIRST_PROJECT_ID" >> $GITHUB_ENV
-            fi
-          else
-            echo "  ❌ No organization projects found (or $OWNER is a user, not an org)"
-            echo "$ORG_RESPONSE" | jq '.errors // empty'
-          fi
-
-      - name: Search Project for Repository Issues
-        run: |
-          if [ -n "${first_project_id:-}" ]; then
             echo ""
-            echo "🔍 Searching project ${first_project_id} for issues from this repository..."
+            echo "✅ Found target project #$PROJECT_NUM: $PROJECT_TITLE"
+            echo "Project ID: $PROJECT_ID"
+            echo "Project URL: $(echo "$TARGET_PROJECT" | jq -r '.url')"
+            
+            # Step 2: Get project fields (following the gist pattern)
+            echo ""
+            echo "📊 Step 2: Getting project fields..."
+            
+            FIELDS_QUERY='{
+              "query": "query($projectId: ID!) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    fields(first: 20) {
+                      nodes {
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                        ... on ProjectV2IterationField {
+                          id
+                          name
+                          dataType
+                        }
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          dataType
+                          options {
+                            id
+                            name
+                            color
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }",
+              "variables": {
+                "projectId": "'$PROJECT_ID'"
+              }
+            }'
+            
+            FIELDS_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/graphql" \
+              -d "$FIELDS_QUERY")
+            
+            echo "Project fields:"
+            echo "$FIELDS_RESPONSE" | jq '.'
+            
+            # Look for Status field specifically
+            STATUS_FIELD=$(echo "$FIELDS_RESPONSE" | jq '.data.node.fields.nodes[] | select(.name == "Status")')
+            if [ -n "$STATUS_FIELD" ] && [ "$STATUS_FIELD" != "null" ]; then
+              echo ""
+              echo "🎯 Found Status field:"
+              echo "$STATUS_FIELD" | jq '.'
+              
+              STATUS_FIELD_ID=$(echo "$STATUS_FIELD" | jq -r '.id')
+              echo "Status Field ID: $STATUS_FIELD_ID"
+              
+              echo "Status options:"
+              echo "$STATUS_FIELD" | jq -r '.options[]? | "  - " + .name + " (ID: " + .id + ", Color: " + .color + ")"'
+            fi
+            
+            # Step 3: Get project items with field values
+            echo ""
+            echo "📋 Step 3: Getting project items..."
             
             ITEMS_QUERY='{
               "query": "query($projectId: ID!) {
                 node(id: $projectId) {
                   ... on ProjectV2 {
-                    title
                     items(first: 100) {
                       nodes {
                         id
+                        type
                         content {
                           ... on Issue {
                             number
@@ -215,18 +235,43 @@ jobs:
                         }
                         fieldValues(first: 20) {
                           nodes {
-                            ... on ProjectV2ItemFieldSingleSelectValue {
-                              name
+                            ... on ProjectV2ItemFieldTextValue {
+                              text
                               field {
-                                ... on ProjectV2SingleSelectField {
+                                ... on ProjectV2FieldCommon {
                                   name
                                 }
                               }
                             }
-                            ... on ProjectV2ItemFieldTextValue {
-                              text
+                            ... on ProjectV2ItemFieldNumberValue {
+                              number
                               field {
-                                ... on ProjectV2Field {
+                                ... on ProjectV2FieldCommon {
+                                  name
+                                }
+                              }
+                            }
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              name
+                              optionId
+                              field {
+                                ... on ProjectV2FieldCommon {
+                                  name
+                                }
+                              }
+                            }
+                            ... on ProjectV2ItemFieldDateValue {
+                              date
+                              field {
+                                ... on ProjectV2FieldCommon {
+                                  name
+                                }
+                              }
+                            }
+                            ... on ProjectV2ItemFieldIterationValue {
+                              title
+                              field {
+                                ... on ProjectV2FieldCommon {
                                   name
                                 }
                               }
@@ -239,7 +284,7 @@ jobs:
                 }
               }",
               "variables": {
-                "projectId": "'${first_project_id}'"
+                "projectId": "'$PROJECT_ID'"
               }
             }'
             
@@ -249,112 +294,90 @@ jobs:
               "https://api.github.com/graphql" \
               -d "$ITEMS_QUERY")
             
-            echo "Project items found:"
+            echo "Project items:"
+            echo "$ITEMS_RESPONSE" | jq '.'
+            
+            # Filter for issues from this repository
             REPO_NAME=$(echo ${{ github.repository }} | cut -d'/' -f2)
             OWNER_NAME=$(echo ${{ github.repository }} | cut -d'/' -f1)
             
-            # Filter issues from this repository
-            REPO_ISSUES=$(echo "$ITEMS_RESPONSE" | jq --arg repo "$REPO_NAME" --arg owner "$OWNER_NAME" '
-              .data.node.items.nodes[] | 
-              select(.content.repository.name == $repo and .content.repository.owner.login == $owner)')
+            echo ""
+            echo "🔍 Issues from repository ${{ github.repository }}:"
             
-            if [ -n "$REPO_ISSUES" ] && [ "$REPO_ISSUES" != "null" ]; then
-              echo "✅ Found issues from this repository in the project:"
-              echo "$REPO_ISSUES" | jq -c '.' | while IFS= read -r issue; do
-                ISSUE_NUM=$(echo "$issue" | jq -r '.content.number')
-                ISSUE_TITLE=$(echo "$issue" | jq -r '.content.title')
-                STATUS_FIELD=$(echo "$issue" | jq -r '.fieldValues.nodes[] | select(.field.name == "Status") | .name // empty')
-                
-                echo "  📋 Issue #$ISSUE_NUM: $ISSUE_TITLE"
-                if [ -n "$STATUS_FIELD" ]; then
-                  echo "    Status: $STATUS_FIELD"
+            echo "$ITEMS_RESPONSE" | jq -c --arg repo "$REPO_NAME" --arg owner "$OWNER_NAME" '
+              .data.node.items.nodes[] | 
+              select(.content.repository.name == $repo and .content.repository.owner.login == $owner)' | \
+            while IFS= read -r item; do
+              ISSUE_NUM=$(echo "$item" | jq -r '.content.number')
+              ISSUE_TITLE=$(echo "$item" | jq -r '.content.title')
+              ISSUE_STATE=$(echo "$item" | jq -r '.content.state')
+              
+              echo "  📋 Issue #$ISSUE_NUM: $ISSUE_TITLE (State: $ISSUE_STATE)"
+              
+              # Show all field values
+              echo "    Field values:"
+              echo "$item" | jq -r '.fieldValues.nodes[] | 
+                if .field.name then
+                  "      " + .field.name + ": " + (.name // .text // (.number | tostring) // .date // .title // "null")
                 else
-                  echo "    Status: (no status field set)"
-                fi
-              done
-            else
-              echo "❌ No issues from this repository found in the project"
-              echo ""
-              echo "📊 All issues found in project:"
-              echo "$ITEMS_RESPONSE" | jq -r '
-                .data.node.items.nodes[] | 
-                select(.content.number != null) | 
-                "  - Issue #" + (.content.number | tostring) + " from " + .content.repository.owner.login + "/" + .content.repository.name'
-            fi
+                  empty
+                end'
+            done
           else
-            echo "❌ No project found to search"
+            echo "❌ Project #$PROJECT_NUM not found"
+            echo "Available projects:"
+            echo "$PROJECTS_RESPONSE" | jq -r '.data.viewer.projectsV2.nodes[]? | "  - #" + (.number | tostring) + ": " + .title'
           fi
 
-  # Find and sync projects
-  find-and-sync-projects:
+  # Sync projects using ProjectsV2 GraphQL
+  sync-projects:
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'schedule' || 
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'find_and_sync_projects')
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'sync_projects')
     
     steps:
-      - name: Find User/Org Projects and Sync
+      - name: Sync ProjectsV2 Items
         run: |
-          echo "🔄 Finding and syncing project items..."
-          OWNER=$(echo ${{ github.repository }} | cut -d'/' -f1)
-          REPO=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          PROJECT_NUM="${{ github.event.inputs.project_number }}"
+          if [ -z "$PROJECT_NUM" ]; then
+            PROJECT_NUM="1"
+          fi
           
-          # Try user projects first
-          USER_QUERY='{
-            "query": "query($login: String!) {
-              user(login: $login) {
-                projectsV2(first: 10) {
+          REPO_NAME=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          OWNER_NAME=$(echo ${{ github.repository }} | cut -d'/' -f1)
+          
+          echo "🔄 Syncing ProjectsV2 #$PROJECT_NUM..."
+          
+          # Get all accessible projects
+          PROJECTS_QUERY='{
+            "query": "query {
+              viewer {
+                projectsV2(first: 20) {
                   nodes {
                     id
                     title
+                    number
                   }
                 }
               }
-            }",
-            "variables": {
-              "login": "'$OWNER'"
-            }
+            }"
           }'
           
-          USER_RESPONSE=$(curl -s -X POST \
+          PROJECTS_RESPONSE=$(curl -s -X POST \
             -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
             "https://api.github.com/graphql" \
-            -d "$USER_QUERY")
+            -d "$PROJECTS_QUERY")
           
-          PROJECT_ID=$(echo "$USER_RESPONSE" | jq -r '.data.user.projectsV2.nodes[0].id // empty')
+          # Find target project
+          PROJECT_ID=$(echo "$PROJECTS_RESPONSE" | jq -r --arg num "$PROJECT_NUM" '
+            .data.viewer.projectsV2.nodes[] | select(.number == ($num | tonumber)) | .id')
           
-          # If no user projects, try org projects
-          if [ -z "$PROJECT_ID" ]; then
-            ORG_QUERY='{
-              "query": "query($login: String!) {
-                organization(login: $login) {
-                  projectsV2(first: 10) {
-                    nodes {
-                      id
-                      title
-                    }
-                  }
-                }
-              }",
-              "variables": {
-                "login": "'$OWNER'"
-              }
-            }'
+          if [ -n "$PROJECT_ID" ] && [ "$PROJECT_ID" != "null" ]; then
+            echo "✅ Found project #$PROJECT_NUM (ID: $PROJECT_ID)"
             
-            ORG_RESPONSE=$(curl -s -X POST \
-              -H "Authorization: bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/graphql" \
-              -d "$ORG_QUERY")
-            
-            PROJECT_ID=$(echo "$ORG_RESPONSE" | jq -r '.data.organization.projectsV2.nodes[0].id // empty')
-          fi
-          
-          if [ -n "$PROJECT_ID" ]; then
-            echo "✅ Found project to sync: $PROJECT_ID"
-            
-            # Get project items for this repository
+            # Get project items with field values
             ITEMS_QUERY='{
               "query": "query($projectId: ID!) {
                 node(id: $projectId) {
@@ -380,7 +403,7 @@ jobs:
                             ... on ProjectV2ItemFieldSingleSelectValue {
                               name
                               field {
-                                ... on ProjectV2SingleSelectField {
+                                ... on ProjectV2FieldCommon {
                                   name
                                 }
                               }
@@ -404,40 +427,46 @@ jobs:
               -d "$ITEMS_QUERY")
             
             # Process repository issues
-            echo "$ITEMS_RESPONSE" | jq -c --arg repo "$REPO" --arg owner "$OWNER" '
+            echo "$ITEMS_RESPONSE" | jq -c --arg repo "$REPO_NAME" --arg owner "$OWNER_NAME" '
               .data.node.items.nodes[] | 
               select(.content.repository.name == $repo and .content.repository.owner.login == $owner)' | \
-            while IFS= read -r issue; do
-              ISSUE_NUMBER=$(echo "$issue" | jq -r '.content.number')
-              PROJECT_STATUS=$(echo "$issue" | jq -r '.fieldValues.nodes[] | select(.field.name == "Status") | .name // empty')
+            while IFS= read -r item; do
+              ISSUE_NUMBER=$(echo "$item" | jq -r '.content.number')
+              ISSUE_STATE=$(echo "$item" | jq -r '.content.state')
+              
+              # Get Status field value
+              PROJECT_STATUS=$(echo "$item" | jq -r '
+                .fieldValues.nodes[] | 
+                select(.field.name == "Status") | 
+                .name // empty')
               
               if [ -n "$PROJECT_STATUS" ]; then
-                echo "🔍 Issue #$ISSUE_NUMBER has project status: $PROJECT_STATUS"
+                echo "🔍 Issue #$ISSUE_NUMBER has Status: '$PROJECT_STATUS'"
                 
                 # Map project status to label
                 case "$PROJECT_STATUS" in
-                  "Backlog"|"Todo"|"To Do"|"New")
+                  "Backlog"|"Todo"|"To Do"|"New"|"📋 Backlog")
                     EXPECTED_LABEL="backlog"
                     ;;
-                  "Ready"|"Ready to Start")
+                  "Ready"|"Ready to Start"|"🏁 Ready")
                     EXPECTED_LABEL="ready"
                     ;;
-                  "In Progress"|"In-Progress"|"Working"|"Active")
+                  "In Progress"|"In-Progress"|"Working"|"Active"|"🚧 In Progress")
                     EXPECTED_LABEL="in-progress"
                     ;;
-                  "In Review"|"Review"|"Testing"|"QA")
+                  "In Review"|"Review"|"Testing"|"QA"|"👀 In Review")
                     EXPECTED_LABEL="in-review"
                     ;;
-                  "Done"|"Complete"|"Completed"|"Closed")
+                  "Done"|"Complete"|"Completed"|"Closed"|"✅ Done")
                     EXPECTED_LABEL="done"
                     ;;
                   *)
-                    echo "❓ Unknown status: $PROJECT_STATUS - skipping"
+                    echo "❓ Unknown status: '$PROJECT_STATUS' - skipping"
                     continue
                     ;;
                 esac
                 
-                # Get current labels
+                # Get current issue labels
                 CURRENT_ISSUE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                   -H "Accept: application/vnd.github.v3+json" \
                   "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER")
@@ -448,7 +477,7 @@ jobs:
                 if echo "$CURRENT_LABELS" | grep -q "^$EXPECTED_LABEL$"; then
                   echo "✅ Issue #$ISSUE_NUMBER already has correct label: $EXPECTED_LABEL"
                 else
-                  echo "🔄 Updating issue #$ISSUE_NUMBER to label: $EXPECTED_LABEL"
+                  echo "🔄 Updating issue #$ISSUE_NUMBER to label: $EXPECTED_LABEL (from status: $PROJECT_STATUS)"
                   
                   # Remove old status labels
                   for label in backlog ready in-progress in-review done; do
@@ -466,8 +495,7 @@ jobs:
                     "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/labels" \
                     -d "{\"labels\":[\"$EXPECTED_LABEL\"]}"
                   
-                  # Handle issue state
-                  ISSUE_STATE=$(echo "$issue" | jq -r '.content.state')
+                  # Handle issue state based on project status
                   if [ "$EXPECTED_LABEL" = "done" ] && [ "$ISSUE_STATE" = "OPEN" ]; then
                     echo "  🔒 Closing issue (project status is Done)"
                     curl -s -X PATCH \
@@ -486,14 +514,20 @@ jobs:
                       -d '{"state":"open"}'
                   fi
                   
-                  echo "  ✅ Updated!"
+                  echo "  ✅ Issue #$ISSUE_NUMBER synced successfully!"
                 fi
+              else
+                echo "📝 Issue #$ISSUE_NUMBER has no Status field set in project"
               fi
               
               sleep 0.5  # Rate limiting
             done
+            
+            echo "🎉 ProjectsV2 sync completed!"
           else
-            echo "❌ No projects found for user/org: $OWNER"
+            echo "❌ Could not find project #$PROJECT_NUM"
+            echo "Available projects:"
+            echo "$PROJECTS_RESPONSE" | jq -r '.data.viewer.projectsV2.nodes[]? | "  - #" + (.number | tostring) + ": " + .title'
           fi
 
   # Update existing issues
