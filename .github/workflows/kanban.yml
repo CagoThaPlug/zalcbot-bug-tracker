@@ -5,8 +5,68 @@ on:
     types: [moved, created]
   issues:
     types: [opened]
+  workflow_dispatch:  # Allows manual triggering
+    inputs:
+      update_existing:
+        description: 'Update all existing issues with default labels'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
+  # Job to update existing issues (manual trigger only)
+  update-existing-issues:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.update_existing == 'true'
+    
+    steps:
+      - name: Update Existing Open Issues
+        run: |
+          echo "Fetching open issues without status labels..."
+          
+          # Get all open issues
+          ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues?state=open&per_page=100" | \
+            jq -r '.[] | select(.labels | map(.name) | index("backlog") == null and index("ready") == null and index("in-progress") == null and index("in-review") == null and index("done") == null) | .number')
+          
+          # Add backlog label to issues without status labels
+          for issue in $ISSUES; do
+            echo "Adding backlog label to issue #$issue"
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$issue/labels" \
+              -d '{"labels":["backlog"]}'
+            sleep 1  # Rate limiting
+          done
+
+      - name: Update Existing Closed Issues
+        run: |
+          echo "Fetching closed issues without status labels..."
+          
+          # Get recent closed issues
+          CLOSED_ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues?state=closed&per_page=50" | \
+            jq -r '.[] | select(.labels | map(.name) | index("backlog") == null and index("ready") == null and index("in-progress") == null and index("in-review") == null and index("done") == null) | .number')
+          
+          # Add done label to closed issues without status labels
+          for issue in $CLOSED_ISSUES; do
+            echo "Adding done label to closed issue #$issue"
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$issue/labels" \
+              -d '{"labels":["done"]}'
+            sleep 1  # Rate limiting
+          done
+
   update-labels:
     runs-on: ubuntu-latest
     if: github.event.project_card.content_url
